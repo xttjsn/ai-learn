@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(python rnn_from_scratch.py:*)",
+      "Bash(pip --version:*)",
+      "Bash(pip install:*)",
+      "Bash(python lstm_from_scratch.py:*)",
+      "Bash(python timing_comparison.py:*)",
+      "Bash(git clone:*)",
+      "Bash(git rm:*)"
+    ]
+  }
+}
