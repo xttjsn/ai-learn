@@ -294,6 +294,259 @@ This is the weighted combination we talked about in the intuition!
 Positions with high attention weights contribute more to the output.
 
 ================================================================================
+PART 6B: WHY ONLY K AND V ARE CACHED (THE "KV CACHE")
+================================================================================
+
+When reading about inference optimization (e.g., the vLLM paper), you'll see
+references to the "KV cache." This connects directly to the formula above.
+
+THE KEY INSIGHT: GENERATION IS TOKEN-BY-TOKEN
+---------------------------------------------
+During training, we process the entire sequence at once:
+
+    Input:  "The cat sat on"  (all 4 tokens at once)
+    Output: Predict "cat sat on the" (shifted by 1)
+
+But during GENERATION, we produce ONE new token at a time:
+
+    Step 1: Input "The"           → predict "cat"
+    Step 2: Input "The cat"       → predict "sat"
+    Step 3: Input "The cat sat"   → predict "on"
+
+At each step, we only need to compute attention for the NEW token.
+But attention requires comparing the new token against ALL previous tokens.
+
+LET'S TRACE THROUGH STEP 3: Input "The cat sat", predicting next token
+----------------------------------------------------------------------
+We already have tokens at positions 0, 1, 2. Now we need attention for
+position 2 ("sat"):
+
+    Attention for position 2:
+        Q_2 = W_Q × x_2          ← query for "sat" (the NEW token)
+        
+        Score against pos 0: Q_2 · K_0    ← need K_0 from "The"
+        Score against pos 1: Q_2 · K_1    ← need K_1 from "cat"  
+        Score against pos 2: Q_2 · K_2    ← need K_2 from "sat"
+        
+        weights = softmax([score_0, score_1, score_2] / √d_k)
+        
+        output_2 = w_0 × V_0 + w_1 × V_1 + w_2 × V_2
+                         ↑           ↑           ↑
+                   need V_0     need V_1     need V_2
+
+Notice what we needed:
+    - Q_2 only (just the current token's query)
+    - K_0, K_1, K_2 (keys for ALL tokens, including previous ones)
+    - V_0, V_1, V_2 (values for ALL tokens, including previous ones)
+
+WITHOUT a cache, we'd recompute K_0, K_1, V_0, V_1 from scratch every step.
+That's wasteful! K_0 = W_K × x_0 gives the same result every time.
+
+WITH a KV cache:
+    Step 1: Compute K_0, V_0 → store in cache
+    Step 2: Compute K_1, V_1 → append to cache. Reuse K_0, V_0.
+    Step 3: Compute K_2, V_2 → append to cache. Reuse K_0, V_0, K_1, V_1.
+
+WHY NOT CACHE Q?
+----------------
+Look at the pattern again:
+
+    Q_2 is used ONCE: to compute scores at step 3.
+    Q_2 is NEVER needed again in any future step.
+
+    K_0 is used at step 1, step 2, step 3, step 4, ... (every future step!)
+    V_0 is used at step 1, step 2, step 3, step 4, ... (every future step!)
+
+    Q = used once, then discarded     → no point caching
+    K = used by every future token    → MUST cache
+    V = used by every future token    → MUST cache
+
+This is why it's called the "KV cache" and not the "QKV cache."
+
+THE MEMORY PROBLEM (WHAT vLLM SOLVES)
+--------------------------------------
+For a model like LLaMA-13B with:
+    - 40 layers, each with its own KV cache
+    - d_model = 5120, so K and V are each 5120-dimensional per token
+    - Sequence length up to 2048 tokens
+
+KV cache per sequence ≈ 40 layers × 2 (K+V) × 2048 tokens × 5120 dims × 2 bytes
+                      ≈ 1.6 GB per sequence!
+
+With many concurrent users, this GPU memory adds up fast.
+And as noted in the vLLM paper, we can't predict:
+    1. How long each sequence will be (it grows token by token)
+    2. When each sequence will finish (generation stops at EOS)
+
+This is exactly why vLLM's PagedAttention matters — it manages this
+unpredictable, growing KV cache memory efficiently using paging,
+just like an OS manages virtual memory.
+
+================================================================================
+PART 6C: HOW INFERENCE ACTUALLY WORKS (PREFILL + DECODE)
+================================================================================
+
+You might wonder: if the model predicts the next token, what does it do when
+you give it a whole prompt like "The cat sat on the"? It already HAS those
+tokens — it doesn't need to "predict" them. So what's happening?
+
+Inference has TWO distinct phases:
+
+PHASE 1: PREFILL (Processing the prompt)
+-----------------------------------------
+When you send a prompt like "The cat sat on the", the model processes ALL
+prompt tokens at once in a single forward pass. But it's NOT trying to
+generate anything yet. It's doing two things:
+
+    1. Building the KV cache for every prompt token
+    2. Getting the logits for the LAST position (to predict what comes next)
+
+Let's trace through it:
+
+    Prompt: "The cat sat on the"
+    Tokens: [  0    1    2   3   4 ]
+
+    Forward pass (all at once, like training):
+    
+        For EVERY layer in the model:
+            Compute Q_0, K_0, V_0  from "The"
+            Compute Q_1, K_1, V_1  from "cat"
+            Compute Q_2, K_2, V_2  from "sat"
+            Compute Q_3, K_3, V_3  from "on"
+            Compute Q_4, K_4, V_4  from "the"
+            
+            Run attention (with causal mask, so position 2 can't see 3,4)
+            
+            Store K_0..K_4 and V_0..V_4 in the KV cache  ← THIS IS THE POINT
+        
+        Output logits at position 4 → predict next token → "mat"
+
+    The model DOES compute logits at positions 0-3 too (predicting "cat",
+    "sat", "on", "the"), but we THROW THOSE AWAY. We only care about the
+    logits at the last position.
+
+    So why not just feed tokens one at a time, like decode phase?
+    We COULD do this:
+        Pass 1: Feed "The"                → compute K_0, V_0, store in cache
+        Pass 2: Feed "cat"                → compute K_1, V_1, store in cache
+        Pass 3: Feed "sat"                → compute K_2, V_2, store in cache
+        Pass 4: Feed "on"                 → compute K_3, V_3, store in cache
+        Pass 5: Feed "the"                → compute K_4, V_4, get prediction
+
+    This would give the EXACT same KV cache and the same prediction.
+    But it's much slower. Here's why:
+
+    GPUs are massively parallel processors. They have thousands of cores
+    that can multiply matrices simultaneously. The bottleneck is usually
+    not computation — it's moving data between GPU memory and the cores.
+
+    One pass with 5 tokens:
+        - Load model weights from GPU memory ONCE
+        - Multiply: [5 tokens × 4096 dims] @ [4096 × 4096 weight matrix]
+        - This is ONE big matrix multiplication — GPU cores stay busy
+        - All 5 tokens' K and V computed simultaneously
+
+    Five passes with 1 token each:
+        - Load model weights from GPU memory FIVE TIMES (once per pass)
+        - Each time: [1 token × 4096 dims] @ [4096 × 4096 weight matrix]
+        - This is FIVE tiny matrix multiplications — GPU cores mostly idle
+        - Most time spent loading weights, not computing
+
+    It's like the difference between:
+        - Carrying 5 boxes in one trip (prefill)
+        - Making 5 separate trips for 1 box each (decode-style)
+
+    The work is the same, but the overhead (loading weights, launching GPU
+    kernels) happens once instead of five times.
+
+    NOTE: This "all at once" is within a SINGLE sequence's prompt.
+    This has nothing to do with batching multiple sequences together
+    (that's a separate optimization). We're just saying: given one
+    prompt of 5 tokens, process all 5 in one matrix operation rather
+    than looping 5 times.
+
+    Think of prefill as: "Read and understand the prompt, and prepare
+    everything needed for fast generation."
+
+PHASE 2: DECODE (Generating tokens one by one)
+-----------------------------------------------
+Now the KV cache is warm. Generation is token-by-token:
+
+    Step 1: We predicted "mat" from prefill.
+            Feed ONLY the new token "mat" into the model.
+            
+            For EVERY layer:
+                Compute Q_5, K_5, V_5 from "mat"
+                Append K_5, V_5 to cache → cache now has K_0..K_5, V_0..V_5
+                Compute attention: Q_5 against K_0..K_5
+                                   (reuse cached K_0..K_4!)
+            
+            Output logits → predict next token → "."
+    
+    Step 2: Feed ONLY "." into the model.
+            
+            For EVERY layer:
+                Compute Q_6, K_6, V_6 from "."
+                Append K_6, V_6 to cache → cache now has K_0..K_6, V_0..V_6
+                Compute attention: Q_6 against K_0..K_6
+            
+            Output logits → predict next token → <EOS>
+    
+    Step 3: Model produced <EOS> (end of sequence). Stop.
+
+    Final output: "The cat sat on the mat."
+                   └── prompt (given) ──┘└ generated ┘
+
+THE CRUCIAL DIFFERENCE BETWEEN PHASES
+--------------------------------------
+    PREFILL:
+        - Input size: entire prompt (could be hundreds/thousands of tokens)
+        - Processed all at once (highly parallel, GPU loves this)
+        - Compute-bound (lots of matrix multiplications)
+        - Happens ONCE
+    
+    DECODE:
+        - Input size: ONE token at a time
+        - Sequential (must wait for each prediction)
+        - Memory-bound (small computation, but reads entire KV cache)
+        - Happens once PER generated token
+
+This is why prefill is fast per-token but decode feels slow:
+    - Prefill: 1000 tokens processed in ~the same time as 1 token
+    - Decode: each token requires a full forward pass through all layers
+
+And this is why KV cache management matters so much:
+    - During decode, every step reads the ENTIRE KV cache
+    - The cache grows by one entry per layer per step
+    - For long conversations, this dominates GPU memory
+
+EXAMPLE WITH REAL NUMBERS
+-------------------------
+    Model: 32 layers, d_model=4096
+    Prompt: 500 tokens
+    Generated: 200 tokens
+
+    Prefill:
+        - Process 500 tokens in one shot
+        - Build KV cache: 32 layers × 2 (K+V) × 500 × 4096 = ~500 MB
+        - Time: ~100ms (GPU-parallel, fast)
+
+    Decode (200 steps):
+        - Each step: process 1 token, read entire cache, append 1 entry
+        - Step 1: read 500 cache entries, write 1
+        - Step 100: read 600 cache entries, write 1
+        - Step 200: read 700 cache entries, write 1
+        - Time: ~200 × 30ms = ~6 seconds (sequential, each step waits)
+
+    Total: ~100ms (prefill) + ~6s (decode) = ~6.1s for 200 tokens
+    
+    Notice: prefill processed 500 tokens in 100ms (0.2ms/token)
+            decode generated 200 tokens in 6s (30ms/token)
+    
+    That's a 150× difference in per-token speed! This is the fundamental
+    bottleneck of autoregressive generation.
+
+================================================================================
 PART 7: MULTI-HEAD ATTENTION - WHY ONE HEAD ISN'T ENOUGH
 ================================================================================
 
@@ -506,6 +759,12 @@ Why expand then contract?
 
     The expanded representation gives the model more "room to think."
     Research suggests a lot of the model's knowledge is stored in FFN weights.
+
+Terminology note: This FFN is also called the "MLP" (Multi-Layer Perceptron)
+    in modern literature. Same thing, different name. You'll see "MLP" everywhere
+    in papers like Megatron-LM and GPT. Also, modern LLMs replace ReLU with GeLU
+    or SwiGLU for smoother gradients, but the structure (expand 4x → activate →
+    shrink back) remains identical.
 
 Important: The FFN is applied to each position INDEPENDENTLY.
     - Position 0 gets transformed by FFN
